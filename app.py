@@ -178,7 +178,8 @@ def mask_contact(contact):
 def anonymize_name(name):
     if not name:
         return ""
-    return "ANON_" + sha256(name.encode()).hexdigest()[:6]
+    return "ANON_" + sha256(str(name).encode()).hexdigest()[:6]
+
 
 def login_user(username, password):
     conn = db_connect()
