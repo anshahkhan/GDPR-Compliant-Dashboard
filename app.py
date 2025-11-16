@@ -189,12 +189,20 @@ def login_user(username, password):
     conn.close()
     return user
 
-def encrypt_value(value: str):
+def encrypt_value(value):
     if value is None:
-        return None
+        return None, None
     key_id, fernet = get_latest_key()
-    encrypted = fernet.encrypt(value.encode())
-    return encrypted, key_id  
+    # Ensure value is bytes
+    if isinstance(value, str):
+        value_bytes = value.encode()
+    elif isinstance(value, bytes):
+        value_bytes = value
+    else:
+        raise TypeError(f"encrypt_value expects str or bytes, got {type(value)}")
+    encrypted = fernet.encrypt(value_bytes)
+    return encrypted, key_id
+
 
 def decrypt_value(encrypted_value, key_id):
     if encrypted_value is None:
