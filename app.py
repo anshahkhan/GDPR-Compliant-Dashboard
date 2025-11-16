@@ -59,12 +59,13 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS patients (
             patient_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            contact TEXT,
+            name BLOB,
+            contact BLOB,
             diagnosis TEXT,
             anonymized_name TEXT,
             anonymized_contact TEXT,
-            date_added TEXT
+            date_added TEXT,
+            key_id INTEGER DEFAULT 1
         )
     """)
 
@@ -206,7 +207,7 @@ def encrypt_value(value):
 
 
 def decrypt_value(encrypted_value, key_id):
-    if encrypted_value is None:
+    if not encrypted_value:
         return ""
     conn = db_connect()
     cur = conn.cursor()
@@ -216,10 +217,48 @@ def decrypt_value(encrypted_value, key_id):
     if not row:
         return "[missing key]"
     fernet = Fernet(row[0].encode())
+    
+    # Ensure encrypted_value is bytes
+    if isinstance(encrypted_value, str):
+        encrypted_value = encrypted_value.encode()
+    
     try:
         return fernet.decrypt(encrypted_value).decode()
     except InvalidToken:
         return "[decryption error]"
+
+
+
+def reencrypt_all_records():
+    """Re-encrypt all patient records using the latest key."""
+    conn = db_connect()
+    cur = conn.cursor()
+
+    # Fetch all patient records that have encrypted values
+    cur.execute("SELECT patient_id, name, contact, key_id FROM patients")
+    rows = cur.fetchall()
+
+    new_key_id, new_fernet = get_latest_key()
+
+    for pid, enc_name, enc_contact, old_key_id in rows:
+        # Decrypt with old key first
+        name = decrypt_value(enc_name, old_key_id) if enc_name else None
+        contact = decrypt_value(enc_contact, old_key_id) if enc_contact else None
+
+        # Encrypt with latest key
+        new_enc_name, _ = encrypt_value(name) if name else (None, None)
+        new_enc_contact, _ = encrypt_value(contact) if contact else (None, None)
+
+        # Update record with new encryption + key_id
+        cur.execute("""
+            UPDATE patients
+            SET name=?, contact=?, key_id=?
+            WHERE patient_id=?
+        """, (new_enc_name, new_enc_contact, new_key_id, pid))
+
+    conn.commit()
+    conn.close()
+    return len(rows)
 
 
 # Fetch the latest key for encryption
@@ -466,6 +505,11 @@ def dashboard():
                     decrypted_contact = decrypt_value(row[1], row[2])
                     st.success(f"Decrypted name: {decrypted_name}")
                     st.success(f"Decrypted contact: {decrypted_contact}")
+                    cur.execute("""
+                        UPDATE patients
+                        SET name=?, contact=?
+                        WHERE patient_id=?
+                    """, (decrypted_name, decrypted_contact, pid_to_decrypt))
                     log_action(user_id, role, "decrypt_patient", f"patient_id={pid_to_decrypt}")
                 else:
                     st.error("Patient not found.")
@@ -483,21 +527,25 @@ def dashboard():
         if st.button("Save"):
             conn = db_connect()
             cur = conn.cursor()
+
+            # Store plaintext in staging columns; name/contact remain NULL until admin encrypts
             cur.execute("""
                 INSERT INTO patients 
-                    (name, contact, name, contact, 
-                    diagnosis, anonymized_name, anonymized_contact, 
-                    date_added, key_id)
-                VALUES (?, ?, NULL, NULL, ?, NULL, NULL, ?, NULL)
+                    (name, contact, diagnosis, anonymized_name, anonymized_contact, date_added)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 name, contact, diagnosis,
+                None, None,
                 datetime.now().strftime("%Y-%m-%d")
             ))
+
             conn.commit()
             conn.close()
 
-            st.success("Patient added (original data stored temporarily).")
-            log_action(user_id, role, "add_patient_original", f"name={name}")
+            st.success("Patient added (awaiting encryption/anonymization by admin).")
+            log_action(user_id, role, "add_patient", f"name={name}")
+
+
 
 
 
@@ -649,45 +697,41 @@ def dashboard():
                     st.rerun()
 
 
-#Anonymize
+# Anonymize
     elif choice == "Anonymize Data" and role == "admin":
         st.subheader("🔐 Encrypt + Anonymize All Records")
 
         if st.button("Encrypt + Anonymize All Records"):
             conn = db_connect()
             cur = conn.cursor()
-
-            cur.execute("SELECT patient_id, name, contact FROM patients")
+            
+            # Get latest key
+            latest_key_id, latest_fernet = get_latest_key()
+            
+            cur.execute("SELECT patient_id, name, contact, key_id FROM patients")
             rows = cur.fetchall()
+            
+            for pid, name, contact, old_key_id in rows:
+                if name or contact:
+                    enc_name = latest_fernet.encrypt(name.encode()) if name else None
+                    enc_contact = latest_fernet.encrypt(contact.encode()) if contact else None
 
-            for pid, name, contact in rows:
+                    anon_name = anonymize_name(name) if name else ""
+                    anon_contact = mask_contact(contact) if contact else ""
 
-                # Encrypt the original fields themselves
-                enc_name, key_id = encrypt_value(name) if name else (None, None)
-                enc_contact, key_id2 = encrypt_value(contact) if contact else (None, None)
-                final_key_id = key_id or key_id2
+                    cur.execute("""
+                        UPDATE patients
+                        SET name=?, contact=?, key_id=?, 
+                            anonymized_name=?, anonymized_contact=?
+                        WHERE patient_id=?
+                    """, (enc_name, enc_contact, latest_key_id, anon_name, anon_contact, pid))
 
-                # Anonymize values
-                anon_name = anonymize_name(name) if name else ""
-                anon_contact = mask_contact(contact) if contact else ""
-
-                # Update DB: overwrite original name/contact
-                cur.execute("""
-                    UPDATE patients
-                    SET name=?, contact=?, key_id=?,
-                        anonymized_name=?, anonymized_contact=?
-                    WHERE patient_id=?
-                """, (
-                    enc_name, enc_contact, final_key_id,
-                    anon_name, anon_contact,
-                    pid
-                ))
-
+            
             conn.commit()
             conn.close()
-
-            st.success("✔ All records ENCRYPTED + ANONYMIZED. Original data replaced.")
+            st.success("All records encrypted + anonymized")
             log_action(user_id, role, "encrypt_anonymize_all", "Admin applied full protection")
+
 
 
 
