@@ -1,0 +1,5 @@
+
+streamlit>=1.10.0
+pandas>=1.4.0
+cryptography>=3.4
+streamlit-autorefresh>=0.1.0
