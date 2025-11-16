@@ -206,19 +206,23 @@ def encrypt_value(value):
     return encrypted, key_id
 
 
-def decrypt_value(encrypted_value, key_id):
+def decrypt_value(encrypted_value, key_id, cur):
     if not encrypted_value:
         return ""
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT key_value FROM fernet_keys WHERE key_id=?", (key_id,))
-    row = cur.fetchone()
-    conn.close()
+    # Use passed cursor/connection if provided
+    if cur:
+        cur.execute("SELECT key_value FROM fernet_keys WHERE key_id=?", (key_id,))
+        row = cur.fetchone()
+    else:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT key_value FROM fernet_keys WHERE key_id=?", (key_id,))
+            row = cur.fetchone()
     if not row:
         return "[missing key]"
     fernet = Fernet(row[0].encode())
-    
-    # Ensure encrypted_value is bytes
+
+    # Ensure bytes
     if isinstance(encrypted_value, str):
         encrypted_value = encrypted_value.encode()
     
@@ -242,8 +246,8 @@ def reencrypt_all_records():
 
     for pid, enc_name, enc_contact, old_key_id in rows:
         # Decrypt with old key first
-        name = decrypt_value(enc_name, old_key_id) if enc_name else None
-        contact = decrypt_value(enc_contact, old_key_id) if enc_contact else None
+        name = decrypt_value(enc_name, old_key_id,cur) if enc_name else None
+        contact = decrypt_value(enc_contact, old_key_id,cur) if enc_contact else None
 
         # Encrypt with latest key
         new_enc_name, _ = encrypt_value(name) if name else (None, None)
@@ -307,6 +311,16 @@ def set_retention_days(days: int):
     cur.execute("REPLACE INTO config (k, v) VALUES (?, ?)", ("retention_days", str(days)))
     conn.commit()
     conn.close()
+
+def ensure_bytes(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.encode()
+    if isinstance(value, bytes):
+        return value
+    raise TypeError(f"Expected str or bytes, got {type(value)}")
+
 
 def retention_cleanup(days: int):
     """Delete patients older than 'days' based on date_added."""
@@ -494,27 +508,27 @@ def dashboard():
             # Decrypt selected patient
             pid_to_decrypt = st.number_input("Enter Patient ID to decrypt", min_value=1, step=1)
             if st.button("Decrypt selected"):
-                conn = db_connect()
-                cur = conn.cursor()
-                cur.execute("SELECT name, contact, key_id FROM patients WHERE patient_id=?", (pid_to_decrypt,))
-                row = cur.fetchone()
-                conn.close()
+                with sqlite3.connect(DB_PATH, timeout=5) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT name, contact, key_id FROM patients WHERE patient_id=?", (pid_to_decrypt,))
+                    row = cur.fetchone()
 
-                if row:
-                    decrypted_name = decrypt_value(row[0], row[2])
-                    decrypted_contact = decrypt_value(row[1], row[2])
-                    st.success(f"Decrypted name: {decrypted_name}")
-                    st.success(f"Decrypted contact: {decrypted_contact}")
-                    cur.execute("""
-                        UPDATE patients
-                        SET name=?, contact=?
-                        WHERE patient_id=?
-                    """, (decrypted_name, decrypted_contact, pid_to_decrypt))
-                    log_action(user_id, role, "decrypt_patient", f"patient_id={pid_to_decrypt}")
-                else:
-                    st.error("Patient not found.")
-
-                log_action(user_id, role, "view_patients")
+                    if row:
+                        decrypted_name = decrypt_value(row[0], row[2],cur)
+                        decrypted_contact = decrypt_value(row[1], row[2],cur)
+                        st.success(f"Decrypted name: {decrypted_name}")
+                        st.success(f"Decrypted contact: {decrypted_contact}")
+                        cur.execute("""
+                            UPDATE patients
+                            SET name=?, contact=?
+                            WHERE patient_id=?
+                        """, (decrypted_name, decrypted_contact, pid_to_decrypt))
+                        log_action(user_id, role, "decrypt_patient", f"patient_id={pid_to_decrypt}")
+                        conn.commit()
+                        conn.close()
+                    else:
+                        st.error("Patient not found.")
+                    log_action(user_id, role, "view_patients")
 
 
  # Add Patient
@@ -711,20 +725,24 @@ def dashboard():
             cur.execute("SELECT patient_id, name, contact, key_id FROM patients")
             rows = cur.fetchall()
             
-            for pid, name, contact, old_key_id in rows:
-                if name or contact:
-                    enc_name = latest_fernet.encrypt(name.encode()) if name else None
-                    enc_contact = latest_fernet.encrypt(contact.encode()) if contact else None
+            for pid, name, contact, old_keys in rows:
+                # Convert to bytes safely
+                name_bytes = ensure_bytes(name)
+                contact_bytes = ensure_bytes(contact)
 
-                    anon_name = anonymize_name(name) if name else ""
-                    anon_contact = mask_contact(contact) if contact else ""
+                enc_name = latest_fernet.encrypt(name_bytes) if name_bytes else None
+                enc_contact = latest_fernet.encrypt(contact_bytes) if contact_bytes else None
 
-                    cur.execute("""
-                        UPDATE patients
-                        SET name=?, contact=?, key_id=?, 
-                            anonymized_name=?, anonymized_contact=?
-                        WHERE patient_id=?
-                    """, (enc_name, enc_contact, latest_key_id, anon_name, anon_contact, pid))
+                anon_name = anonymize_name(name) if name else ""
+                anon_contact = mask_contact(contact) if contact else ""
+
+                cur.execute("""
+                    UPDATE patients
+                    SET name=?, contact=?, key_id=?, 
+                        anonymized_name=?, anonymized_contact=?
+                    WHERE patient_id=?
+                """, (enc_name, enc_contact, latest_key_id, anon_name, anon_contact, pid))
+
 
             
             conn.commit()
@@ -881,7 +899,7 @@ def dashboard():
     # Fernet Keys page (admin)
     elif choice == "Fernet Keys" and role == "admin":
         st.subheader("Fernet Key Management (Demo)")
-        st.write("A single Fernet key is stored in `fernet.key` in the app folder for demo purposes. In production, store keys in a secure vault.")
+        # st.write("A single Fernet key is stored in `fernet.key` in the app folder for demo purposes. In production, store keys in a secure vault.")
         st.code(FERNET_KEY.decode())
         if st.button("Rotate key (demo)"):
             
